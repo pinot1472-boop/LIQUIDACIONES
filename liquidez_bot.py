@@ -12,6 +12,7 @@ import os
 import re
 import time
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -85,6 +86,19 @@ REPORT_TZ = os.getenv("REPORT_TZ", "Europe/Madrid")
 REPORT_TIME = os.getenv("REPORT_TIME", "23:59")
 FEE_PCT_ROUNDTRIP = float(os.getenv("FEE_PCT_ROUNDTRIP", "0.1"))
 
+# Extras traidos del indicador de TradingView (UT Bot + LinReg + S/R + panel)
+LQ_USE_UT = env_bool("LQ_USE_UT", True)                    # UT Bot (trailing stop ATR) como confirmacion
+UT_ATR_PERIOD = int(os.getenv("UT_ATR_PERIOD", "10"))
+UT_MULT = float(os.getenv("UT_MULT", "2"))
+LQ_UT_REQUIRE = env_bool("LQ_UT_REQUIRE", False)           # exigir UT a favor (filtro duro)
+LQ_USE_LINREG = env_bool("LQ_USE_LINREG", True)            # velas LinReg + linea de senal
+LINREG_LEN = int(os.getenv("LINREG_LEN", "11"))
+LINREG_SIGNAL = int(os.getenv("LINREG_SIGNAL", "7"))
+LQ_USE_SR = env_bool("LQ_USE_SR", True)                    # coincidencia con maximos/minimos de 100-500 velas
+LQ_USE_HTF = env_bool("LQ_USE_HTF", True)                  # tendencia EMA9/21 en TF superiores + max/min de ayer
+LQ_HTF_MIN_ALIGNED = int(os.getenv("LQ_HTF_MIN_ALIGNED", "0"))   # TF superiores a favor minimos (0 = solo puntua)
+LQ_SHOW_PANEL = env_bool("LQ_SHOW_PANEL", True)            # panel de mercado en el mensaje
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("liquidez-bot")
 
@@ -95,7 +109,7 @@ CLOSED = []      # operaciones cerradas desde el ultimo resumen
 
 # ======================= UTILIDADES =======================
 def tf_seconds(tf):
-    return int(tf[:-1]) * {"m": 60, "h": 3600, "d": 86400}[tf[-1]]
+    return int(tf[:-1]) * {"m": 60, "h": 3600, "d": 86400, "w": 604800}[tf[-1]]
 
 
 def calc_ema_last(values, period):
@@ -123,6 +137,125 @@ def fmt_link(symbol):
 
 def pretty(x):
     return f"{x:.8g}"
+
+
+def fmt_age(bars, tf):
+    secs = bars * tf_seconds(tf)
+    if secs >= 86400:
+        return f"{secs / 86400:.1f} d"
+    if secs >= 3600:
+        return f"{secs / 3600:.0f} h"
+    return f"{secs / 60:.0f} min"
+
+
+# ======================= INDICADORES (del Pine: UT Bot, LinReg, S/R, panel) =======================
+def atr_series(c, period):
+    """ATR de Wilder (como ta.atr). Lista alineada con c; None mientras no hay datos."""
+    out = [None] * len(c)
+    if len(c) <= period:
+        return out
+    trs = [c[0][2] - c[0][3]]
+    for i in range(1, len(c)):
+        trs.append(max(c[i][2] - c[i][3], abs(c[i][2] - c[i - 1][4]), abs(c[i][3] - c[i - 1][4])))
+    prev = sum(trs[:period]) / period
+    out[period - 1] = prev
+    for i in range(period, len(c)):
+        prev = (prev * (period - 1) + trs[i]) / period
+        out[i] = prev
+    return out
+
+
+def ut_bot(c, mult, period):
+    """UT Bot: trailing stop por ATR sobre el cierre. state=1 alcista, -1 bajista."""
+    atr = atr_series(c, period)
+    trail = prev_src = None
+    state, flip_i = 0, None
+    for i, x in enumerate(c):
+        if atr[i] is None:
+            continue
+        src, nl = x[4], mult * atr[i]
+        if trail is None:
+            new = src - nl
+        elif src > trail and prev_src > trail:
+            new = max(trail, src - nl)
+        elif src < trail and prev_src < trail:
+            new = min(trail, src + nl)
+        else:
+            new = src - nl if src > trail else src + nl
+        trail = new
+        st = 1 if src > trail else (-1 if src < trail else state)
+        if st != state:
+            flip_i = i
+        state, prev_src = st, src
+    if trail is None:
+        return None
+    return {"state": state, "trail": trail,
+            "since_flip": (len(c) - 1 - flip_i) if flip_i is not None else 999}
+
+
+def linreg_last(vals, length):
+    y = vals[-length:]
+    n = len(y)
+    if n < length or n < 2:
+        return None
+    xm, ym = (n - 1) / 2, sum(y) / n
+    den = sum((i - xm) ** 2 for i in range(n))
+    slope = sum((i - xm) * (v - ym) for i, v in enumerate(y)) / den
+    return ym + slope * ((n - 1) - xm)
+
+
+def linreg_signal(closes, length, sig_len):
+    """(cierre LinReg actual, media de senal). Cierre > senal = impulso alcista."""
+    pts = []
+    for k in range(sig_len):
+        end = len(closes) - (sig_len - 1 - k)
+        v = linreg_last(closes[max(0, end - length):end], length)
+        if v is None:
+            return None
+        pts.append(v)
+    return pts[-1], sum(pts) / sig_len
+
+
+def sr_levels(c):
+    """Maximos/minimos de 10..1000 velas (lineas S/R del Pine): [(ventana, max, min)]."""
+    n = len(c)
+    return [(w, max(x[2] for x in c[-w:]), min(x[3] for x in c[-w:]))
+            for w in (10, 50, 100, 250, 500, 1000) if n >= w]
+
+
+def ema_series(vals, period):
+    if len(vals) < period:
+        return []
+    k = 2 / (period + 1)
+    prev = sum(vals[:period]) / period
+    out = [prev]
+    for v in vals[period:]:
+        prev = v * k + prev * (1 - k)
+        out.append(prev)
+    return out
+
+
+def rsi_last(closes, period=14):
+    if len(closes) <= period:
+        return None
+    ag = sum(max(closes[i] - closes[i - 1], 0) for i in range(1, period + 1)) / period
+    al = sum(max(closes[i - 1] - closes[i], 0) for i in range(1, period + 1)) / period
+    for i in range(period + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        ag = (ag * (period - 1) + max(d, 0)) / period
+        al = (al * (period - 1) + max(-d, 0)) / period
+    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+
+
+def stoch_kd(c, length=14, sk=3, sd=3):
+    raw = []
+    for i in range(length - 1, len(c)):
+        w = c[i - length + 1:i + 1]
+        hh, ll = max(x[2] for x in w), min(x[3] for x in w)
+        raw.append(50.0 if hh == ll else 100 * (c[i][4] - ll) / (hh - ll))
+    ks = [sum(raw[j - sk + 1:j + 1]) / sk for j in range(sk - 1, len(raw))]
+    ds = [sum(ks[j - sd + 1:j + 1]) / sd for j in range(sd - 1, len(ks))]
+    return (ks[-1], ds[-1]) if ks and ds else None
 
 
 # ======================= LIQUIDACIONES ESTIMADAS =======================
@@ -251,6 +384,10 @@ def detect_signal(closed, ema200):
     c2, c1 = closed[-2], closed[-1]
     min_sw, max_sw = LQ_MIN_SWEEP_ATR * atr, LQ_MAX_SWEEP_ATR * atr
     best = None
+    ut = ut_bot(closed, UT_MULT, UT_ATR_PERIOD) if LQ_USE_UT else None
+    lrs = linreg_signal([x[4] for x in closed], LINREG_LEN, LINREG_SIGNAL) if LQ_USE_LINREG else None
+    srl = sr_levels(closed[:-2]) if LQ_USE_SR else []
+    late_max = 8 if LQ_USE_HTF else 0     # bonus maximo que se suma despues (TF superiores + ayer)
 
     for z in zones:
         if z["score"] < LQ_MIN_ZONE_SCORE:
@@ -334,11 +471,32 @@ def detect_signal(closed, ema200):
                    + (10 if aligned else 0)
                    + (5 if rr >= 2 else 0)
                    - (10 if kind == "REBOTE" else 0))
-        if quality < LQ_MIN_QUALITY:
+        # --- extras importados del Pine ---
+        want = 1 if side == "LONG" else -1
+        ut_pts = lr_pts = sr_pts = 0
+        sr_txt = None
+        if ut:
+            ut_ok = ut["state"] == want
+            if LQ_UT_REQUIRE and not ut_ok:
+                continue
+            ut_pts = (4 if ut_ok else 0) + (2 if ut_ok and ut["since_flip"] <= 3 else 0)
+        if lrs:
+            lr_ok = (lrs[0] > lrs[1]) if want == 1 else (lrs[0] < lrs[1])
+            lr_pts = 3 if lr_ok else 0
+        for w, hi, lo in reversed(srl):
+            lvl = hi if bsl else lo
+            if w >= 100 and abs(lvl - L) <= tol:
+                sr_pts = 3
+                sr_txt = f"coincide con {'máx' if bsl else 'mín'} de {w} velas"
+                break
+        quality += ut_pts + lr_pts + sr_pts
+        if quality < LQ_MIN_QUALITY - late_max:
             continue
         cand_sig = {"side": side, "kind": kind, "zone": z, "entry": entry, "sl": sl, "tp": tp,
                     "rr": rr, "quality": quality, "rv": rv, "wick": wk, "tp_zone": tp_zone,
-                    "aligned": aligned, "atr": atr, "ts": c1[0]}
+                    "aligned": aligned, "atr": atr, "ts": c1[0], "tol": tol,
+                    "ut": ut, "lr": lrs, "sr_txt": sr_txt,
+                    "extras": {"UT": ut_pts, "LinReg": lr_pts, "S/R": sr_pts}}
         if best is None or quality > best["quality"]:
             best = cand_sig
     return best
@@ -465,6 +623,21 @@ async def analyze(ex, session, sem, symbol, tf):
     sig = detect_signal(closed, ema200)
     if not sig:
         return 0
+    htf = None
+    if LQ_USE_HTF:
+        try:
+            htf = await get_htf_context(ex, symbol, tf, sig)
+        except Exception as e:
+            log.debug("%s HTF error: %s", symbol, e)
+        if htf:
+            sig["extras"]["HTF"] = htf["bonus"]
+            sig["extras"]["Ayer"] = htf["pd_bonus"]
+            sig["quality"] += htf["bonus"] + htf["pd_bonus"]
+    sig["quality"] = min(100.0, sig["quality"])
+    if sig["quality"] < LQ_MIN_QUALITY:
+        return 0
+    if htf and htf["aligned"] < LQ_HTF_MIN_ALIGNED:
+        return 0
     z = sig["zone"]
     risk_pct = abs(sig["sl"] - sig["entry"]) / sig["entry"] * 100
     rew_pct = abs(sig["tp"] - sig["entry"]) / sig["entry"] * 100
@@ -474,17 +647,25 @@ async def analyze(ex, session, sem, symbol, tf):
     kind_txt = {"SOUP": "TURTLE SOUP", "SOUP+1": "TURTLE SOUP PLUS ONE", "REBOTE": "REBOTE EN LIQUIDEZ"}[sig["kind"]]
     emoji = "🟢" if sig["side"] == "LONG" else "🔴"
     hora = datetime.fromtimestamp(last[0] / 1000, tz=timezone.utc).strftime("%H:%M UTC")
+    extras_txt = " · ".join(f"{k} {int(v):+d}" for k, v in sig["extras"].items() if v)
+    extras_line = f"Extras: {extras_txt}\n" if extras_txt else ""
+    sr_extra = f" · {sig['sr_txt']}" if sig["sr_txt"] else ""
+    age_line = f"Longevidad: sin barrer hace {fmt_age(z['age'], tf)} ({z['age']} velas){sr_extra}\n"
+    panel = build_panel(closed, sig, htf) if LQ_SHOW_PANEL else ""
     await send_telegram(session,
         f"{emoji} <b>{sig['side']} · {kind_txt}</b> · {tf}\n<b>{symbol}</b>\n"
         f"Zona: {zname} <code>{pretty(z['level'])}</code>{extra}\n"
         f"Zona {z['ztype']} · importancia <b>{z['score']:.0f}/100</b> "
         f"(toques {z['touches']} · liquidaciones x{z['ratio']:.1f})\n"
+        f"{age_line}"
         f"Calidad: <b>{sig['quality']:.0f}/100</b> · RVOL {sig['rv']:.1f}x · mecha {sig['wick'] * 100:.0f}%\n"
+        f"{extras_line}"
         f"Entrada: <code>{pretty(sig['entry'])}</code>\n"
         f"SL: <code>{pretty(sig['sl'])}</code> (-{risk_pct:.2f}%)\n"
         f"TP: <code>{pretty(sig['tp'])}</code> (+{rew_pct:.2f}%) → R:R <b>{sig['rr']:.1f}</b>\n"
         f"Objetivo: {tp_txt}\n"
         f"EMA{EMA_PERIOD}: {'a favor ✅' if sig['aligned'] else 'en contra ⚠️'}\n"
+        f"{panel}"
         f"Salir: TP, SL o a las {LQ_MAX_HOLD_BARS} velas · Vela {hora}\n{link}")
     POSITIONS[key] = {"side": sig["side"], "kind": sig["kind"], "entry": sig["entry"],
                       "sl": sig["sl"], "tp": sig["tp"], "ts": sig["ts"]}
@@ -493,6 +674,106 @@ async def analyze(ex, session, sem, symbol, tf):
 
 def z_name(z):
     return f"{'BSL' if z['kind'] == 'BSL' else 'SSL'} {pretty(z['level'])} ({z['ztype']}, {z['score']:.0f} pts)"
+
+
+HTF_MAP = {"1m": ["5m", "15m", "1h"], "3m": ["15m", "1h", "4h"], "5m": ["15m", "1h", "4h"],
+           "15m": ["1h", "4h", "1d"], "30m": ["1h", "4h", "1d"], "1h": ["4h", "1d", "1w"]}
+
+
+def htf_list(tf):
+    if tf in HTF_MAP:
+        return HTF_MAP[tf]
+    base = tf_seconds(tf)
+    return [t for t in ("15m", "1h", "4h", "1d", "1w") if tf_seconds(t) > base][:3] or ["1d"]
+
+
+async def get_htf_context(ex, symbol, tf, sig):
+    """Tendencia EMA9/21 en 3 TF superiores (como el panel del Pine) + max/min de ayer."""
+    tfs = htf_list(tf)
+    need = list(dict.fromkeys(tfs + ["1d"]))
+    res = await asyncio.gather(*[ex.fetch_ohlcv(symbol, t, limit=60) for t in need], return_exceptions=True)
+    data = {t: r for t, r in zip(need, res) if not isinstance(r, Exception) and r}
+    want = 1 if sig["side"] == "LONG" else -1
+    trends, aligned, opposed = [], 0, 0
+    for t in tfs:
+        d = data.get(t)
+        if not d or len(d) < 25:
+            continue
+        cl = [x[4] for x in d]
+        e9, e21 = calc_ema_last(cl, 9), calc_ema_last(cl, 21)
+        tr = 1 if e9 > e21 else (-1 if e9 < e21 else 0)
+        trends.append((t, tr))
+        aligned += tr == want
+        opposed += tr == -want
+    pdh = pdl = None
+    pd_bonus = 0
+    d1 = data.get("1d")
+    if d1 and len(d1) >= 2:
+        pdh, pdl = d1[-2][2], d1[-2][3]
+        lvl = pdh if sig["zone"]["kind"] == "BSL" else pdl
+        if abs(lvl - sig["zone"]["level"]) <= sig["tol"]:
+            pd_bonus = 2
+    if not trends and pdh is None:
+        return None
+    return {"trends": trends, "aligned": aligned, "bonus": max(-4, min(6, 2 * aligned - opposed)),
+            "pd_bonus": pd_bonus, "pdh": pdh, "pdl": pdl}
+
+
+def build_panel(closed, sig, htf):
+    """Panel de mercado (version Telegram del dashboard del Pine). Termina en salto de linea."""
+    ic = lambda ok: "🟢" if ok else "🔴"
+    cl = [x[4] for x in closed]
+    out = ["", "📊 <b>Panel</b>"]
+    a = [v for v in atr_series(closed[-250:], 14) if v is not None]
+    if len(a) >= 20:
+        w = a[-20:]
+        sma = sum(w) / 20
+        sd = math.sqrt(sum((v - sma) ** 2 for v in w) / 20)
+        top, bot = sma + 2 * sd, sma - 2 * sd
+        vol = 30 + 40 * ((a[-1] - bot) / max(1e-10, top - bot))
+        st = "alta 🟢" if a[-1] > sma * 1.2 else ("baja 🔴" if a[-1] < sma * 0.8 else "media ➖")
+        out.append(f"Volatilidad {vol:.0f}% · ATR {st}")
+    vols = [x[5] or 0 for x in closed]
+    vma = sum(vols[-20:]) / 20
+    if vma > 0:
+        out.append(f"Volumen {vols[-1] / vma:.1f}x media20 {ic(vols[-1] > vma)}")
+    day0 = closed[-1][0] - closed[-1][0] % 86400000
+    dv = [(x[4], x[5] or 0) for x in closed if x[0] >= day0]
+    tv = sum(v for _, v in dv)
+    if tv > 0 and len(dv) >= 3:
+        vw = sum(p * v for p, v in dv) / tv
+        out.append(f"VWAP del día: precio {'por encima' if cl[-1] > vw else 'por debajo'} {ic(cl[-1] > vw)}")
+    parts = []
+    c3 = cl[-300:]
+    e12, e26 = ema_series(c3, 12), ema_series(c3, 26)
+    if e26:
+        m = [e12[j + 14] - e26[j] for j in range(len(e26))]
+        s9 = ema_series(m, 9)
+        if s9:
+            parts.append(f"MACD {ic(m[-1] > s9[-1])} {'alcista' if m[-1] > s9[-1] else 'bajista'}")
+    kd = stoch_kd(closed[-80:])
+    if kd:
+        k, d = kd
+        parts.append(f"Stoch {ic(k > d)} {'sobrecompra' if k > 80 else 'sobreventa' if k < 20 else 'neutral'}")
+    rsi = rsi_last(cl[-200:])
+    if rsi is not None:
+        parts.append(f"RSI {rsi:.0f}")
+    if parts:
+        out.append(" · ".join(parts))
+    ut = sig.get("ut")
+    if ut:
+        flip = f" (giro hace {ut['since_flip']} velas)" if ut["since_flip"] <= 3 else ""
+        out.append(f"UT Bot: {'🟢 alcista' if ut['state'] == 1 else '🔴 bajista'} · trail <code>{pretty(ut['trail'])}</code>{flip}")
+    lr = sig.get("lr")
+    if lr:
+        out.append(f"LinReg: {ic(lr[0] > lr[1])} {'alcista' if lr[0] > lr[1] else 'bajista'}")
+    if htf and htf["trends"]:
+        sym = {1: "🟢", -1: "🔴", 0: "➖"}
+        out.append("Tendencia EMA9/21: " + " · ".join(f"{t} {sym[v]}" for t, v in htf["trends"]))
+    if htf and htf["pdh"] is not None:
+        hit = " ← la zona coincide" if htf["pd_bonus"] else ""
+        out.append(f"Ayer: máx <code>{pretty(htf['pdh'])}</code> · mín <code>{pretty(htf['pdl'])}</code>{hit}")
+    return "\n".join(out) + "\n"
 
 
 async def scan(ex, session, tf, symbols):
