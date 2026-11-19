@@ -523,19 +523,71 @@ def manage_position(pos, closed):
 
 
 # ======================= TELEGRAM =======================
+# Cola con ritmo controlado: Telegram permite ~1 msg/s por chat (20/min en grupos) y, si se excede,
+# responde 429 con un "retry_after" que puede ser de HORAS. Seguir enviando durante el bloqueo lo alarga.
+TG_MIN_INTERVAL = float(os.getenv("TG_MIN_INTERVAL", "3.2"))   # seg entre mensajes
+TG_MAX_AGE = float(os.getenv("TG_MAX_AGE_SEC", "900"))         # una senal con mas de 15 min ya no sirve
+TG_QUEUE_MAX = int(os.getenv("TG_QUEUE_MAX", "100"))
+TG_QUEUE = None
+TG_BLOCKED_UNTIL = 0.0
+
+
 async def send_telegram(session, text):
+    """Encola el mensaje (no bloquea el escaneo). Lo envia telegram_worker respetando limites."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Falta TELEGRAM_TOKEN o TELEGRAM_CHAT_ID")
         return
+    if TG_QUEUE is None:
+        return
+    if TG_QUEUE.full():
+        try:
+            TG_QUEUE.get_nowait()  # descarta el mas antiguo
+            log.warning("Cola de Telegram llena: descartado el mensaje mas antiguo")
+        except asyncio.QueueEmpty:
+            pass
+    TG_QUEUE.put_nowait((time.time(), text))
+
+
+async def telegram_worker(session):
+    global TG_BLOCKED_UNTIL
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
-               "disable_web_page_preview": True}
-    try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            if r.status != 200:
-                log.error("Telegram %s: %s", r.status, await r.text())
-    except Exception as e:
-        log.error("Error Telegram: %s", e)
+    while True:
+        ts, text = await TG_QUEUE.get()
+        plain = False
+        while True:
+            now = time.time()
+            if now - ts > TG_MAX_AGE:
+                log.warning("Mensaje descartado por antiguo (%.0f min en cola)", (now - ts) / 60)
+                break
+            if now < TG_BLOCKED_UNTIL:
+                await asyncio.sleep(min(60.0, TG_BLOCKED_UNTIL - now))
+                continue
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+            if not plain:
+                payload["parse_mode"] = "HTML"
+            try:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    body = await r.text()
+                    if r.status == 200:
+                        await asyncio.sleep(TG_MIN_INTERVAL)
+                        break
+                    if r.status == 429:
+                        m = re.search(r'"retry_after"\s*:\s*(\d+)', body)
+                        wait = int(m.group(1)) if m else 60
+                        if time.time() >= TG_BLOCKED_UNTIL:  # loguea una sola vez por bloqueo
+                            log.error("Telegram 429: bloqueado %d s (~%.1f h). Pauso envios.", wait, wait / 3600)
+                        TG_BLOCKED_UNTIL = time.time() + wait + 1
+                        continue
+                    if r.status == 400 and "parse" in body.lower() and not plain:
+                        plain = True  # HTML mal formado: reenviar como texto plano
+                        text = re.sub(r"<[^>]+>", "", text)
+                        continue
+                    log.error("Telegram %s: %s", r.status, body[:200])
+                    break
+            except Exception as e:
+                log.error("Error Telegram: %s", e)
+                await asyncio.sleep(5)
+                break
 
 
 async def send_long(session, text):
@@ -880,7 +932,10 @@ async def refresh_symbols(ex, symbols_ref):
 async def main():
     ex = ccxt.bingx({"enableRateLimit": True,
                      "options": {"defaultType": "swap" if MARKET_TYPE == "swap" else "spot"}})
+    global TG_QUEUE
+    TG_QUEUE = asyncio.Queue(maxsize=TG_QUEUE_MAX)
     async with aiohttp.ClientSession() as session:
+        tg_task = asyncio.create_task(telegram_worker(session))
         try:
             symbols = await get_symbols(ex)
             log.info("Monedas cripto: %d (excluidas %d)", len(symbols), len(EXCLUDED))
@@ -895,6 +950,7 @@ async def main():
             await asyncio.gather(refresh_symbols(ex, symbols_ref), daily_report_loop(session),
                                  *[tf_loop(ex, session, tf, symbols_ref) for tf in TIMEFRAMES])
         finally:
+            tg_task.cancel()
             await ex.close()
 
 
